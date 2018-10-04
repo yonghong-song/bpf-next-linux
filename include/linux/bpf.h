@@ -303,6 +303,8 @@ struct bpf_prog_aux {
 	void *security;
 #endif
 	struct bpf_prog_offload *offload;
+	struct btf *btf;
+	u32 type_id; /* type id for this prog/func */
 	union {
 		struct work_struct work;
 		struct rcu_head	rcu;

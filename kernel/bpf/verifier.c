@@ -4262,6 +4262,50 @@ err_free:
 	return ret;
 }
 
+static int check_btf_func(struct bpf_prog *prog, struct bpf_verifier_env *env,
+			  union bpf_attr *attr)
+{
+	struct bpf_func_info *data;
+	int i, nfuncs, ret = 0;
+
+	if (!attr->func_info_len)
+		return 0;
+
+	nfuncs = attr->func_info_len / sizeof(struct bpf_func_info);
+	if (env->subprog_cnt != nfuncs) {
+		verbose(env, "number of funcs in func_info does not match verifier\n");
+		return -EINVAL;
+	}
+
+	data = kvmalloc(attr->func_info_len, GFP_KERNEL | __GFP_NOWARN);
+	if (!data) {
+		verbose(env, "no memory to allocate attr func_info\n");
+		return -ENOMEM;
+	}
+
+	if (copy_from_user(data, u64_to_user_ptr(attr->func_info),
+			   attr->func_info_len)) {
+		verbose(env, "memory copy error for attr func_info\n");
+		ret = -EFAULT;
+		goto cleanup;
+		}
+
+	for (i = 0; i < nfuncs; i++) {
+		if (env->subprog_info[i].start != data[i].insn_offset) {
+			verbose(env, "func_info subprog start (%d) does not match verifier (%d)\n",
+				env->subprog_info[i].start, data[i].insn_offset);
+			ret = -EINVAL;
+			goto cleanup;
+		}
+		env->subprog_info[i].type_id = data[i].type_id;
+	}
+
+	prog->aux->type_id = data[0].type_id;
+cleanup:
+	kvfree(data);
+	return ret;
+}
+
 /* check %cur's range satisfies %old's */
 static bool range_within(struct bpf_reg_state *old,
 			 struct bpf_reg_state *cur)
@@ -5487,6 +5531,8 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		func[i]->aux->name[0] = 'F';
 		func[i]->aux->stack_depth = env->subprog_info[i].stack_depth;
 		func[i]->jit_requested = 1;
+		func[i]->aux->btf = prog->aux->btf;
+		func[i]->aux->type_id = env->subprog_info[i].type_id;
 		func[i] = bpf_int_jit_compile(func[i]);
 		if (!func[i]->jited) {
 			err = -ENOTSUPP;
@@ -5918,6 +5964,10 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr)
 	env->allow_ptr_leaks = capable(CAP_SYS_ADMIN);
 
 	ret = check_cfg(env);
+	if (ret < 0)
+		goto skip_full_check;
+
+	ret = check_btf_func(env->prog, env, attr);
 	if (ret < 0)
 		goto skip_full_check;
 

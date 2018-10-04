@@ -46,5 +46,7 @@ void btf_type_seq_show(const struct btf *btf, u32 type_id, void *obj,
 		       struct seq_file *m);
 int btf_get_fd_by_id(u32 id);
 u32 btf_id(const struct btf *btf);
+bool is_btf_func_type(const struct btf *btf, u32 type_id);
+const char *btf_get_prog_name(const struct btf *btf, u32 type_id);
 
 #endif

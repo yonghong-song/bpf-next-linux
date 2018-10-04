@@ -467,6 +467,15 @@ static const struct btf_type *btf_type_by_id(const struct btf *btf, u32 type_id)
 	return btf->types[type_id];
 }
 
+bool is_btf_func_type(const struct btf *btf, u32 type_id)
+{
+	const struct btf_type *type = btf_type_by_id(btf, type_id);
+
+	if (!type || BTF_INFO_KIND(type->info) != BTF_KIND_FUNC)
+		return false;
+	return true;
+}
+
 /*
  * Regular int is not a bit field and it must be either
  * u8/u16/u32/u64.
@@ -2550,4 +2559,14 @@ int btf_get_fd_by_id(u32 id)
 u32 btf_id(const struct btf *btf)
 {
 	return btf->id;
+}
+
+const char *btf_get_prog_name(const struct btf *btf, u32 type_id)
+{
+	const struct btf_type *t = btf_type_by_id(btf, type_id);
+
+	if (!t || !btf_type_is_func(t))
+		return NULL;
+
+	return btf_name_by_offset(btf, t->name_off);
 }

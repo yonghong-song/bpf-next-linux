@@ -1338,8 +1338,45 @@ bpf_prog_load_check_attach_type(enum bpf_prog_type prog_type,
 	}
 }
 
+static int prog_check_btf(const struct bpf_prog *prog, const struct btf *btf,
+			  union bpf_attr *attr)
+{
+	struct bpf_func_info __user *uinfo, info;
+	int i, nfuncs, usize;
+	u32 prev_offset = 0;
+
+	usize = sizeof(struct bpf_func_info);
+	if (attr->func_info_len % usize)
+		return -EINVAL;
+
+	/* func_info section should have increasing and valid insn_offset
+	 * and type should be BTF_KIND_FUNC.
+	 */
+	prev_offset = -1;
+	nfuncs = attr->func_info_len / usize;
+	uinfo = u64_to_user_ptr(attr->func_info);
+	for (i = 0; i < nfuncs; i++) {
+		if (copy_from_user(&info, uinfo, usize))
+			return -EFAULT;
+
+		if (!is_btf_func_type(btf, info.type_id))
+			return -EINVAL;
+
+		if (i == 0) {
+			if (info.insn_offset)
+				return -EINVAL;
+		} else if (info.insn_offset < prev_offset) {
+			return -EINVAL;
+		}
+
+		prev_offset = info.insn_offset;
+	}
+
+	return 0;
+}
+
 /* last field in 'union bpf_attr' used by this command */
-#define	BPF_PROG_LOAD_LAST_FIELD expected_attach_type
+#define	BPF_PROG_LOAD_LAST_FIELD func_info
 
 static int bpf_prog_load(union bpf_attr *attr)
 {
@@ -1426,6 +1463,27 @@ static int bpf_prog_load(union bpf_attr *attr)
 	if (err)
 		goto free_prog;
 
+	/* copy func_info before verifier which may make
+	 * some adjustment.
+	 */
+	if (attr->func_info_len) {
+		struct btf *btf;
+
+		btf = btf_get_by_fd(attr->prog_btf_fd);
+		if (IS_ERR(btf)) {
+			err = PTR_ERR(btf);
+			goto free_prog;
+		}
+
+		err = prog_check_btf(prog, btf, attr);
+		if (err) {
+			btf_put(btf);
+			goto free_prog;
+		}
+
+		prog->aux->btf = btf;
+	}
+
 	/* run eBPF verifier */
 	err = bpf_check(&prog, attr);
 	if (err < 0)
@@ -1458,6 +1516,7 @@ free_used_maps:
 	bpf_prog_kallsyms_del_subprogs(prog);
 	free_used_maps(prog->aux);
 free_prog:
+	btf_put(prog->aux->btf);
 	bpf_prog_uncharge_memlock(prog);
 free_prog_sec:
 	security_bpf_prog_free(prog->aux);
@@ -2100,6 +2159,30 @@ static int bpf_prog_get_info_by_fd(struct bpf_prog *prog,
 			}
 		} else {
 			info.jited_func_lens = 0;
+		}
+	}
+
+	if (prog->aux->btf) {
+		info.btf_id = btf_id(prog->aux->btf);
+
+		ulen = info.nr_jited_func_types;
+		info.nr_jited_func_types = prog->aux->func_cnt;
+		if (info.nr_jited_func_types && ulen) {
+			if (bpf_dump_raw_ok()) {
+				u32 __user *user_types;
+				u32 func_type, i;
+
+				ulen = min_t(u32, info.nr_jited_func_types,
+					     ulen);
+				user_types = u64_to_user_ptr(info.jited_func_types);
+				for (i = 0; i < ulen; i++) {
+					func_type = prog->aux->func[i]->aux->type_id;
+					if (put_user(func_type, &user_types[i]))
+						return -EFAULT;
+				}
+			} else {
+				info.jited_func_types = 0;
+			}
 		}
 	}
 
