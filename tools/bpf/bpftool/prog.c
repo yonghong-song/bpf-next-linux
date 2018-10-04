@@ -47,6 +47,7 @@
 #include <linux/err.h>
 
 #include <bpf.h>
+#include <btf.h>
 #include <libbpf.h>
 
 #include "cfg.h"
@@ -427,9 +428,11 @@ static int do_show(int argc, char **argv)
 static int do_dump(int argc, char **argv)
 {
 	unsigned long *func_ksyms = NULL;
+	unsigned int *func_types = NULL;
 	struct bpf_prog_info info = {};
 	unsigned int *func_lens = NULL;
 	unsigned int nr_func_ksyms;
+	unsigned int nr_func_types;
 	unsigned int nr_func_lens;
 	struct dump_data dd = {};
 	__u32 len = sizeof(info);
@@ -526,6 +529,16 @@ static int do_dump(int argc, char **argv)
 		}
 	}
 
+	nr_func_types = info.nr_jited_func_types;
+	if (nr_func_types) {
+		func_types = malloc(nr_func_types * sizeof(__u32));
+		if (!func_types) {
+			p_err("mem alloc failed");
+			close(fd);
+			goto err_free;
+		}
+	}
+
 	memset(&info, 0, sizeof(info));
 
 	*member_ptr = ptr_to_u64(buf);
@@ -534,6 +547,8 @@ static int do_dump(int argc, char **argv)
 	info.nr_jited_ksyms = nr_func_ksyms;
 	info.jited_func_lens = ptr_to_u64(func_lens);
 	info.nr_jited_func_lens = nr_func_lens;
+	info.jited_func_types = ptr_to_u64(func_types);
+	info.nr_jited_func_types = nr_func_types;
 
 	err = bpf_obj_get_info_by_fd(fd, &info, &len);
 	close(fd);
@@ -557,11 +572,22 @@ static int do_dump(int argc, char **argv)
 		goto err_free;
 	}
 
+	if (info.nr_jited_func_types > nr_func_types) {
+		p_err("too many types returned");
+		goto err_free;
+	}
+
 	if ((member_len == &info.jited_prog_len &&
 	     info.jited_prog_insns == 0) ||
 	    (member_len == &info.xlated_prog_len &&
 	     info.xlated_prog_insns == 0)) {
 		p_err("error retrieving insn dump: kernel.kptr_restrict set?");
+		goto err_free;
+	}
+
+	if (info.btf_id &&
+	    info.nr_jited_func_lens != info.nr_jited_func_types) {
+		p_err("unequal jited func lens and types");
 		goto err_free;
 	}
 
@@ -598,13 +624,23 @@ static int do_dump(int argc, char **argv)
 			struct kernel_sym *sym = NULL;
 			char sym_name[SYM_MAX_NAME];
 			unsigned char *img = buf;
+			struct btf *btf = NULL;
 			__u64 *ksyms = NULL;
+			char func_sig[1024];
 			__u32 *lens;
 			__u32 i;
 
 			if (info.nr_jited_ksyms) {
 				kernel_syms_load(&dd);
 				ksyms = (__u64 *) info.jited_ksyms;
+			}
+
+			if (info.btf_id) {
+				err = btf_get_from_id(info.btf_id, &btf);
+				if (err) {
+					p_err("failed to get btf");
+					goto err_free;
+				}
 			}
 
 			if (json_output)
@@ -622,12 +658,27 @@ static int do_dump(int argc, char **argv)
 					strcpy(sym_name, "unknown");
 				}
 
+				func_sig[0] = '\0';
+				if (btf) {
+					err = btf_dumper_type_only(btf, func_types[i],
+								   func_sig,
+								   sizeof(func_sig));
+					if (err < 0)
+						func_sig[0] = '\0';
+				}
+
 				if (json_output) {
 					jsonw_start_object(json_wtr);
+					if (func_sig[0] != '\0') {
+						jsonw_name(json_wtr, "proto");
+						jsonw_string(json_wtr, func_sig);
+					}
 					jsonw_name(json_wtr, "name");
 					jsonw_string(json_wtr, sym_name);
 					jsonw_name(json_wtr, "insns");
 				} else {
+					if (func_sig[0] != '\0')
+						printf("%s:\n", func_sig);
 					printf("%s:\n", sym_name);
 				}
 
@@ -665,12 +716,14 @@ static int do_dump(int argc, char **argv)
 	free(buf);
 	free(func_ksyms);
 	free(func_lens);
+	free(func_types);
 	return 0;
 
 err_free:
 	free(buf);
 	free(func_ksyms);
 	free(func_lens);
+	free(func_types);
 	return -1;
 }
 

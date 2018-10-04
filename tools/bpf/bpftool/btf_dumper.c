@@ -249,3 +249,94 @@ int btf_dumper_type(const struct btf_dumper *d, __u32 type_id,
 {
 	return btf_dumper_do_type(d, type_id, 0, data);
 }
+
+#define BTF_PRINT_STRING(str)						\
+	{								\
+		pos += snprintf(func_sig + pos, size - pos, str);	\
+		if (pos >= size)					\
+			return -1;					\
+	}
+#define BTF_PRINT_ONE_ARG(fmt, arg)					\
+	{								\
+		pos += snprintf(func_sig + pos, size - pos, fmt, arg);	\
+		if (pos >= size)					\
+			return -1;					\
+	}
+#define BTF_PRINT_TYPE_ONLY(type)					\
+	{								\
+		pos = __btf_dumper_type_only(btf, type, func_sig,	\
+					     pos, size);		\
+		if (pos == -1)						\
+			return -1;					\
+	}
+
+static int __btf_dumper_type_only(struct btf *btf, __u32 type_id, char *func_sig, int pos, int size)
+{
+	const struct btf_type *t = btf__type_by_id(btf, type_id);
+	const struct btf_array *array;
+	int i, vlen;
+
+	switch (BTF_INFO_KIND(t->info)) {
+	case BTF_KIND_INT:
+		BTF_PRINT_ONE_ARG("%s ", btf__name_by_offset(btf, t->name_off));
+		break;
+	case BTF_KIND_STRUCT:
+		BTF_PRINT_ONE_ARG("struct %s ", btf__name_by_offset(btf, t->name_off));
+		break;
+	case BTF_KIND_UNION:
+		BTF_PRINT_ONE_ARG("union %s ", btf__name_by_offset(btf, t->name_off));
+		break;
+	case BTF_KIND_ENUM:
+		BTF_PRINT_ONE_ARG("enum %s ", btf__name_by_offset(btf, t->name_off));
+		break;
+	case BTF_KIND_ARRAY:
+		array = (struct btf_array *)(t + 1);
+		BTF_PRINT_TYPE_ONLY(array->type);
+		BTF_PRINT_ONE_ARG("[%d]", array->nelems);
+		break;
+	case BTF_KIND_PTR:
+		BTF_PRINT_TYPE_ONLY(t->type);
+		BTF_PRINT_STRING("* ");
+		break;
+	case BTF_KIND_UNKN:
+	case BTF_KIND_FWD:
+	case BTF_KIND_TYPEDEF:
+		return -1;
+	case BTF_KIND_VOLATILE:
+		BTF_PRINT_STRING("volatile ");
+		BTF_PRINT_TYPE_ONLY(t->type);
+		break;
+	case BTF_KIND_CONST:
+		BTF_PRINT_STRING("const ");
+		BTF_PRINT_TYPE_ONLY(t->type);
+		break;
+	case BTF_KIND_RESTRICT:
+		BTF_PRINT_STRING("restrict ");
+		BTF_PRINT_TYPE_ONLY(t->type);
+		break;
+	case BTF_KIND_FUNC:
+	case BTF_KIND_FUNC_PROTO:
+		BTF_PRINT_TYPE_ONLY(t->type);
+		BTF_PRINT_ONE_ARG("%s(", btf__name_by_offset(btf, t->name_off));
+		vlen = BTF_INFO_VLEN(t->info);
+		for (i = 0; i < vlen; i++) {
+			__u32 arg_type = ((__u32 *)(t + 1))[i];
+
+			BTF_PRINT_TYPE_ONLY(arg_type);
+			if (i != (vlen - 1)) {
+				BTF_PRINT_STRING(", ");
+			}
+		}
+		BTF_PRINT_STRING(")");
+		break;
+	default:
+		return -1;
+	}
+
+	return pos;
+}
+
+int btf_dumper_type_only(struct btf *btf, __u32 type_id, char *func_sig, int size)
+{
+	return __btf_dumper_type_only(btf, type_id, func_sig, 0, size);
+}
