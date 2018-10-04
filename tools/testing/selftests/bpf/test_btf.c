@@ -5,6 +5,7 @@
 #include <linux/btf.h>
 #include <linux/err.h>
 #include <linux/kernel.h>
+#include <linux/filter.h>
 #include <bpf/bpf.h>
 #include <sys/resource.h>
 #include <libelf.h>
@@ -22,9 +23,13 @@
 #include "bpf_rlimit.h"
 #include "bpf_util.h"
 
+#define MAX_INSNS	512
+#define MAX_SUBPROGS	16
+
 static uint32_t pass_cnt;
 static uint32_t error_cnt;
 static uint32_t skip_cnt;
+static bool jit_enabled;
 
 #define CHECK(condition, format...) ({					\
 	int __ret = !!(condition);					\
@@ -58,6 +63,24 @@ static int __base_pr(const char *format, ...)
 	err = vfprintf(stderr, format, args);
 	va_end(args);
 	return err;
+}
+
+static bool is_jit_enabled(void)
+{
+	const char *jit_sysctl = "/proc/sys/net/core/bpf_jit_enable";
+	bool enabled = false;
+	int sysctl_fd;
+
+	sysctl_fd = open(jit_sysctl, 0, O_RDONLY);
+	if (sysctl_fd != -1) {
+		char tmpc;
+
+		if (read(sysctl_fd, &tmpc, sizeof(tmpc)) == 1)
+			enabled = (tmpc != '0');
+		close(sysctl_fd);
+	}
+
+	return enabled;
 }
 
 #define BTF_INFO_ENC(kind, root, vlen)			\
@@ -103,6 +126,7 @@ static struct args {
 	bool get_info_test;
 	bool pprint_test;
 	bool always_log;
+	bool func_type_test;
 } args;
 
 static char btf_log_buf[BTF_LOG_BUF_SIZE];
@@ -2693,16 +2717,256 @@ static int test_pprint(void)
 	return err;
 }
 
+static struct btf_func_type_test {
+	const char *descr;
+	const char *str_sec;
+	__u32 raw_types[MAX_NR_RAW_TYPES];
+	__u32 str_sec_size;
+	struct bpf_insn insns[MAX_INSNS];
+	__u32 prog_type;
+	struct bpf_func_info func_info[MAX_SUBPROGS];
+	__u32 func_info_len;
+	bool expected_prog_load_failure;
+} func_type_test[] = {
+
+{
+	.descr = "func_type test #1",
+	.str_sec = "\0int\0unsigned int\0funcA\0funcB",
+	.raw_types = {
+		BTF_TYPE_INT_ENC(NAME_TBD, BTF_INT_SIGNED, 0, 32, 4),  /* [1] */
+		BTF_TYPE_INT_ENC(NAME_TBD, 0, 0, 32, 4),               /* [2] */
+		BTF_TYPE_ENC(NAME_TBD, BTF_INFO_ENC(BTF_KIND_FUNC, 0, 2), 1),  /* [3] */
+		1, 2,
+		BTF_TYPE_ENC(NAME_TBD, BTF_INFO_ENC(BTF_KIND_FUNC, 0, 2), 1),  /* [4] */
+		2, 1,
+		BTF_END_RAW,
+	},
+	.str_sec_size = sizeof("\0int\0unsigned int\0funcA\0funcB"),
+	.insns = {
+		BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 1, 0, 2),
+		BPF_MOV64_IMM(BPF_REG_0, 1),
+		BPF_EXIT_INSN(),
+		BPF_MOV64_IMM(BPF_REG_0, 2),
+		BPF_EXIT_INSN(),
+	},
+	.prog_type = BPF_PROG_TYPE_TRACEPOINT,
+	.func_info = { {0, 3}, {3, 4} },
+	.func_info_len = 2 * sizeof(struct bpf_func_info),
+},
+
+{
+	.descr = "func_type test #2",
+	.str_sec = "\0int\0unsigned int\0funcA\0funcB",
+	.raw_types = {
+		BTF_TYPE_INT_ENC(NAME_TBD, BTF_INT_SIGNED, 0, 32, 4),  /* [1] */
+		BTF_TYPE_INT_ENC(NAME_TBD, 0, 0, 32, 4),               /* [2] */
+		/* incorrect func type */
+		BTF_TYPE_ENC(NAME_TBD, BTF_INFO_ENC(BTF_KIND_FUNC_PROTO, 0, 2), 1),  /* [3] */
+		1, 2,
+		BTF_TYPE_ENC(NAME_TBD, BTF_INFO_ENC(BTF_KIND_FUNC, 0, 2), 1),  /* [4] */
+		2, 1,
+		BTF_END_RAW,
+	},
+	.str_sec_size = sizeof("\0int\0unsigned int\0funcA\0funcB"),
+	.insns = {
+		BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 1, 0, 2),
+		BPF_MOV64_IMM(BPF_REG_0, 1),
+		BPF_EXIT_INSN(),
+		BPF_MOV64_IMM(BPF_REG_0, 2),
+		BPF_EXIT_INSN(),
+	},
+	.prog_type = BPF_PROG_TYPE_TRACEPOINT,
+	.func_info = { {0, 3}, {3, 4} },
+	.func_info_len = 2 * sizeof(struct bpf_func_info),
+	.expected_prog_load_failure = true,
+},
+
+{
+	.descr = "func_type test #3",
+	.str_sec = "\0int\0unsigned int\0funcA\0funcB",
+	.raw_types = {
+		BTF_TYPE_INT_ENC(NAME_TBD, BTF_INT_SIGNED, 0, 32, 4),  /* [1] */
+		BTF_TYPE_INT_ENC(NAME_TBD, 0, 0, 32, 4),               /* [2] */
+		BTF_TYPE_ENC(NAME_TBD, BTF_INFO_ENC(BTF_KIND_FUNC, 0, 2), 1),  /* [3] */
+		1, 2,
+		BTF_TYPE_ENC(NAME_TBD, BTF_INFO_ENC(BTF_KIND_FUNC, 0, 2), 1),  /* [4] */
+		2, 1,
+		BTF_END_RAW,
+	},
+	.str_sec_size = sizeof("\0int\0unsigned int\0funcA\0funcB"),
+	.insns = {
+		BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 1, 0, 2),
+		BPF_MOV64_IMM(BPF_REG_0, 1),
+		BPF_EXIT_INSN(),
+		BPF_MOV64_IMM(BPF_REG_0, 2),
+		BPF_EXIT_INSN(),
+	},
+	.prog_type = BPF_PROG_TYPE_TRACEPOINT,
+	.func_info = { {0, 3}, {3, 4} },
+	/* incorrect func_info_len */
+	.func_info_len = sizeof(struct bpf_func_info),
+	.expected_prog_load_failure = true,
+},
+
+{
+	.descr = "func_type test #4",
+	.str_sec = "\0int\0unsigned int\0funcA\0funcB",
+	.raw_types = {
+		BTF_TYPE_INT_ENC(NAME_TBD, BTF_INT_SIGNED, 0, 32, 4),  /* [1] */
+		BTF_TYPE_INT_ENC(NAME_TBD, 0, 0, 32, 4),               /* [2] */
+		BTF_TYPE_ENC(NAME_TBD, BTF_INFO_ENC(BTF_KIND_FUNC, 0, 2), 1),  /* [3] */
+		1, 2,
+		BTF_TYPE_ENC(NAME_TBD, BTF_INFO_ENC(BTF_KIND_FUNC, 0, 2), 1),  /* [4] */
+		2, 1,
+		BTF_END_RAW,
+	},
+	.str_sec_size = sizeof("\0int\0unsigned int\0funcA\0funcB"),
+	.insns = {
+		BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 1, 0, 2),
+		BPF_MOV64_IMM(BPF_REG_0, 1),
+		BPF_EXIT_INSN(),
+		BPF_MOV64_IMM(BPF_REG_0, 2),
+		BPF_EXIT_INSN(),
+	},
+	.prog_type = BPF_PROG_TYPE_TRACEPOINT,
+	/* incorrect func_info insn_offset */
+	.func_info = { {0, 3}, {2, 4} },
+	.func_info_len = 2 * sizeof(struct bpf_func_info),
+	.expected_prog_load_failure = true,
+},
+
+};
+
+static size_t probe_prog_length(const struct bpf_insn *fp)
+{
+	size_t len;
+
+	for (len = MAX_INSNS - 1; len > 0; --len)
+		if (fp[len].code != 0 || fp[len].imm != 0)
+			break;
+	return len + 1;
+}
+
+static int do_test_func_type(int test_num)
+{
+	const struct btf_func_type_test *test = &func_type_test[test_num];
+	__u32 func_lens[4], func_types[4], info_len;
+	struct bpf_load_program_attr attr = {};
+	unsigned int raw_btf_size;
+	struct bpf_prog_info info = {};
+	int btf_fd, prog_fd, err = 0;
+	void *raw_btf;
+
+	fprintf(stderr, "%s......", test->descr);
+	raw_btf = btf_raw_create(&hdr_tmpl, test->raw_types,
+				 test->str_sec, test->str_sec_size,
+				 &raw_btf_size);
+
+	if (!raw_btf)
+		return -1;
+
+	*btf_log_buf = '\0';
+	btf_fd = bpf_load_btf(raw_btf, raw_btf_size,
+			      btf_log_buf, BTF_LOG_BUF_SIZE,
+			      args.always_log);
+	free(raw_btf);
+
+	if (CHECK(btf_fd == -1, "invalid btf_fd errno:%d", errno)) {
+		fprintf(stderr, "%s\n", btf_log_buf);
+		err = -1;
+		goto done;
+	}
+
+	attr.prog_type = test->prog_type;
+	attr.insns = test->insns;
+	attr.insns_cnt = probe_prog_length(attr.insns);
+	attr.license = "GPL";
+	attr.prog_btf_fd = btf_fd;
+	attr.func_info_len = test->func_info_len;
+	attr.func_info = test->func_info;
+
+	*btf_log_buf = '\0';
+	prog_fd = bpf_load_program_xattr(&attr, btf_log_buf,
+					 BTF_LOG_BUF_SIZE);
+	if (test->expected_prog_load_failure && prog_fd == -1) {
+		err = 0;
+		goto done;
+	}
+	if (CHECK(prog_fd == -1, "invalid prog_id errno:%d", errno)) {
+		fprintf(stderr, "%s\n", btf_log_buf);
+		err = -1;
+		goto done;
+	}
+	if (!jit_enabled) {
+		skip_cnt++;
+		fprintf(stderr, "SKIPPED, please enable sysctl bpf_jit_enable\n");
+		err = 0;
+		goto done;
+	}
+
+	info_len = sizeof(struct bpf_prog_info);
+	info.nr_jited_func_types = 4;
+	info.nr_jited_func_lens = 4;
+	info.jited_func_types = ptr_to_u64(&func_types[0]);
+	info.jited_func_lens = ptr_to_u64(&func_lens[0]);
+	err = bpf_obj_get_info_by_fd(prog_fd, &info, &info_len);
+	if (CHECK(err == -1, "invalid get info errno:%d", errno)) {
+		fprintf(stderr, "%s\n", btf_log_buf);
+		err = -1;
+		goto done;
+	}
+	if (CHECK(info.nr_jited_func_lens != 2,
+		  "incorrect info.nr_jited_func_lens %d\n",
+		  info.nr_jited_func_lens)) {
+		err = -1;
+		goto done;
+	}
+	if (CHECK(info.nr_jited_func_types != 2,
+		  "incorrect info.nr_jited_func_types %d\n",
+		  info.nr_jited_func_types)) {
+		err = -1;
+		goto done;
+	}
+	if (CHECK(info.btf_id == 0, "incorrect btf_id = 0")) {
+		err = -1;
+		goto done;
+	}
+	if (CHECK(func_types[0] != test->func_info[0].type_id ||
+		  func_types[1] != test->func_info[1].type_id,
+		  "incorrect func_types (%u, %u) expected (%u %d)",
+		  func_types[0], func_types[1],
+		  test->func_info[0].type_id, test->func_info[1].type_id)) {
+		err = -1;
+		goto done;
+	}
+
+done:
+	return err;
+}
+
+static int test_func_type(void)
+{
+	unsigned int i;
+	int err = 0;
+
+	for (i = 0; i < ARRAY_SIZE(func_type_test); i++)
+		err |= count_result(do_test_func_type(i));
+
+	return err;
+}
+
 static void usage(const char *cmd)
 {
-	fprintf(stderr, "Usage: %s [-l] [[-r test_num (1 - %zu)] | [-g test_num (1 - %zu)] | [-f test_num (1 - %zu)] | [-p]]\n",
+	fprintf(stderr, "Usage: %s [-l] [[-r test_num (1 - %zu)] |"
+			" [-g test_num (1 - %zu)] |"
+			" [-f test_num (1 - %zu)] | [-p] | [-k] ]\n",
 		cmd, ARRAY_SIZE(raw_tests), ARRAY_SIZE(get_info_tests),
 		ARRAY_SIZE(file_tests));
 }
 
 static int parse_args(int argc, char **argv)
 {
-	const char *optstr = "lpf:r:g:";
+	const char *optstr = "lpkf:r:g:";
 	int opt;
 
 	while ((opt = getopt(argc, argv, optstr)) != -1) {
@@ -2724,6 +2988,9 @@ static int parse_args(int argc, char **argv)
 			break;
 		case 'p':
 			args.pprint_test = true;
+			break;
+		case 'k':
+			args.func_type_test = true;
 			break;
 		case 'h':
 			usage(argv[0]);
@@ -2778,6 +3045,8 @@ int main(int argc, char **argv)
 	if (args.always_log)
 		libbpf_set_print(__base_pr, __base_pr, __base_pr);
 
+	jit_enabled = is_jit_enabled();
+
 	if (args.raw_test)
 		err |= test_raw();
 
@@ -2790,8 +3059,11 @@ int main(int argc, char **argv)
 	if (args.pprint_test)
 		err |= test_pprint();
 
+	if (args.func_type_test)
+		err |= test_func_type();
+
 	if (args.raw_test || args.get_info_test || args.file_test ||
-	    args.pprint_test)
+	    args.pprint_test || args.func_type_test)
 		goto done;
 
 	err |= test_raw();
