@@ -37,6 +37,11 @@ struct btf {
 	int fd;
 };
 
+struct btf_ext {
+	void *func_info;
+	__u32 func_info_len;
+};
+
 static inline __u64 ptr_to_u64(const void *ptr)
 {
 	return (__u64) (unsigned long) ptr;
@@ -465,4 +470,229 @@ exit_free:
 	free(ptr);
 
 	return err;
+}
+
+static int btf_ext_validate_func_info(const struct btf_sec_func_info *sinfo,
+				      __u32 size, btf_print_fn_t err_log)
+{
+	int sec_hdrlen = sizeof(struct btf_sec_func_info);
+	__u32 record_size = sizeof(struct bpf_func_info);
+	__u32 size_left = size, num_records;
+	__u64 total_record_size;
+
+	while (size_left) {
+		if (size_left < sec_hdrlen) {
+			elog("BTF.ext func_info header not found");
+			return -EINVAL;
+		}
+
+		num_records = sinfo->num_func_info;
+		if (num_records == 0) {
+			elog("incorrect BTF.ext num_func_info");
+			return -EINVAL;
+		}
+
+		total_record_size = sec_hdrlen +
+				    (__u64)num_records * record_size;
+		if (size_left < total_record_size) {
+			elog("incorrect BTF.ext num_func_info");
+			return -EINVAL;
+		}
+
+		size_left -= total_record_size;
+		sinfo = (void *)sinfo + total_record_size;
+	}
+
+	return 0;
+}
+static int btf_ext_parse_hdr(__u8 *data, __u32 data_size,
+			     btf_print_fn_t err_log)
+{
+	const struct btf_ext_header *hdr = (struct btf_ext_header *)data;
+	const struct btf_sec_func_info *sinfo;
+	__u32 meta_left, last_func_info_pos;
+
+	if (data_size < sizeof(*hdr)) {
+		elog("BTF.ext header not found");
+		return -EINVAL;
+	}
+
+	if (hdr->magic != BTF_MAGIC) {
+		elog("Invalid BTF.ext magic:%x\n", hdr->magic);
+		return -EINVAL;
+	}
+
+	if (hdr->version != BTF_VERSION) {
+		elog("Unsupported BTF.ext version:%u\n", hdr->version);
+		return -ENOTSUP;
+	}
+
+	if (hdr->flags) {
+		elog("Unsupported BTF.ext flags:%x\n", hdr->flags);
+		return -ENOTSUP;
+	}
+
+	meta_left = data_size - sizeof(*hdr);
+	if (!meta_left) {
+		elog("BTF.ext has no data\n");
+		return -EINVAL;
+	}
+
+	if (meta_left < hdr->func_info_off) {
+		elog("Invalid BTF.ext func_info section offset:%u\n",
+		     hdr->func_info_off);
+		return -EINVAL;
+	}
+
+	if (hdr->func_info_off & 0x02) {
+		elog("BTF.ext func_info section is not aligned to 4 bytes\n");
+		return -EINVAL;
+	}
+
+	last_func_info_pos = sizeof(*hdr) + hdr->func_info_off +
+			     hdr->func_info_len;
+	if (last_func_info_pos > data_size) {
+		elog("Invalid BTF.ext func_info section size:%u\n",
+		     hdr->func_info_len);
+		return -EINVAL;
+	}
+
+	sinfo = (const struct btf_sec_func_info *)(data + sizeof(*hdr) +
+						   hdr->func_info_off);
+	return btf_ext_validate_func_info(sinfo, hdr->func_info_len,
+					  err_log);
+}
+
+void btf_ext__free(struct btf_ext *btf_ext)
+{
+	if (!btf_ext)
+		return;
+
+	free(btf_ext->func_info);
+	free(btf_ext);
+}
+
+struct btf_ext *btf_ext__new(__u8 *data, __u32 size, btf_print_fn_t err_log)
+{
+	int hdrlen = sizeof(struct btf_ext_header);
+	const struct btf_ext_header *hdr;
+	struct btf_ext *btf_ext;
+	void *fdata;
+	int err;
+
+	err = btf_ext_parse_hdr(data, size, err_log);
+	if (err)
+		return ERR_PTR(err);
+
+	btf_ext = calloc(1, sizeof(struct btf_ext));
+	if (!btf_ext)
+		return ERR_PTR(-ENOMEM);
+
+	hdr = (const struct btf_ext_header *)data;
+	fdata = malloc(hdr->func_info_len);
+	if (!fdata)
+		return ERR_PTR(-ENOMEM);
+
+	memcpy(fdata, data + hdrlen + hdr->func_info_off, hdr->func_info_len);
+	btf_ext->func_info = fdata;
+	btf_ext->func_info_len = hdr->func_info_len;
+
+	return btf_ext;
+}
+
+int btf_ext_reloc_init(struct btf *btf, struct btf_ext *btf_ext,
+		       const char *sec_name, __u32 *btf_fd,
+		       void **func_info, __u32 *func_info_len)
+{
+	int sec_hdrlen = sizeof(struct btf_sec_func_info);
+	int record_len = sizeof(struct bpf_func_info);
+	struct btf_sec_func_info *sinfo;
+	int i, remain_len, records_len;
+	const char *info_sec_name;
+	void *data;
+
+	if (!btf || !btf_ext) {
+		*btf_fd = 0;
+		*func_info = NULL;
+		*func_info_len = 0;
+		return 0;
+	}
+
+	sinfo = btf_ext->func_info;
+	remain_len = btf_ext->func_info_len;
+	*btf_fd = btf__fd(btf);
+
+	while (remain_len > 0) {
+		records_len = sinfo->num_func_info * record_len;
+		info_sec_name = btf__name_by_offset(btf, sinfo->sec_name_off);
+		if (strcmp(info_sec_name, sec_name)) {
+			remain_len -= sec_hdrlen + records_len;
+			sinfo = (void *)sinfo + sec_hdrlen + records_len;
+			continue;
+		}
+
+		data = malloc(records_len);
+		if (!data)
+			return -ENOMEM;
+
+		memcpy(data, sinfo->data, records_len);
+
+		/* adjust the insn_offset, the data in .BTF.ext is
+		 * the actual byte offset, and the kernel expects
+		 * the offset in term of bpf_insn.
+		*/
+		for (i = 0; i < sinfo->num_func_info; i++)
+			((struct bpf_func_info *)data)[i].insn_offset
+				/= sizeof(struct bpf_insn);
+
+		*func_info = data;
+		*func_info_len = records_len;
+		break;
+	}
+
+	return 0;
+}
+
+int btf_ext_reloc(struct btf *btf, struct btf_ext *btf_ext, const char *sec_name,
+		  __u32 insns_cnt, void **func_info, __u32 *func_info_len)
+{
+	int sec_hdrlen = sizeof(struct btf_sec_func_info);
+	int record_len = sizeof(struct bpf_func_info);
+	__u32 i, remain_len, records_len;
+	struct btf_sec_func_info *sinfo;
+	struct bpf_func_info *record;
+	const char *info_sec_name;
+	__u32 existing_flen;
+	void *data;
+
+	if (!*func_info)
+		return 0;
+
+	sinfo = btf_ext->func_info;
+	remain_len = btf_ext->func_info_len;
+	while (remain_len > 0) {
+		records_len = sinfo->num_func_info * record_len;
+		info_sec_name = btf__name_by_offset(btf, sinfo->sec_name_off);
+		if (strcmp(info_sec_name, sec_name)) {
+			remain_len -= sec_hdrlen + records_len;
+			sinfo = (void *)sinfo + sec_hdrlen + records_len;
+			continue;
+		}
+
+		existing_flen = *func_info_len;
+		data = realloc(*func_info, existing_flen + records_len);
+		if (!data)
+			return -ENOMEM;
+
+		memcpy(data + existing_flen, sinfo->data, records_len);
+		record = data + existing_flen;
+		for (i = 0; i < sinfo->num_func_info; i++)
+			record[i].insn_offset =
+				record[i].insn_offset/sizeof(struct bpf_insn) + insns_cnt;
+		*func_info = data;
+		*func_info_len = existing_flen + records_len;
+		break;
+	}
+
+	return 0;
 }

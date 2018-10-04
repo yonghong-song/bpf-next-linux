@@ -164,6 +164,9 @@ struct bpf_program {
 	bpf_program_clear_priv_t clear_priv;
 
 	enum bpf_attach_type expected_attach_type;
+	__u32 btf_fd;
+	void *func_info;
+	__u32 func_info_len;
 };
 
 struct bpf_map {
@@ -220,6 +223,7 @@ struct bpf_object {
 	struct list_head list;
 
 	struct btf *btf;
+	struct btf_ext *btf_ext;
 
 	void *priv;
 	bpf_object_clear_priv_t clear_priv;
@@ -793,6 +797,15 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 					   BTF_ELF_SEC, PTR_ERR(obj->btf));
 				obj->btf = NULL;
 			}
+		} else if (strcmp(name, BTF_EXT_ELF_SEC) == 0) {
+			obj->btf_ext = btf_ext__new(data->d_buf, data->d_size,
+						    __pr_debug);
+			if (IS_ERR(obj->btf_ext)) {
+				pr_warning("Error loading ELF section %s: %ld. Ignored and continue.\n",
+					   BTF_EXT_ELF_SEC,
+					   PTR_ERR(obj->btf_ext));
+				obj->btf_ext = NULL;
+			}
 		} else if (sh.sh_type == SHT_SYMTAB) {
 			if (obj->efile.symbols) {
 				pr_warning("bpf: multiple SYMTAB in %s\n",
@@ -1175,6 +1188,7 @@ bpf_program__reloc_text(struct bpf_program *prog, struct bpf_object *obj,
 	struct bpf_insn *insn, *new_insn;
 	struct bpf_program *text;
 	size_t new_cnt;
+	int err;
 
 	if (relo->type != RELO_CALL)
 		return -LIBBPF_ERRNO__RELOC;
@@ -1197,6 +1211,16 @@ bpf_program__reloc_text(struct bpf_program *prog, struct bpf_object *obj,
 			pr_warning("oom in prog realloc\n");
 			return -ENOMEM;
 		}
+
+		err = btf_ext_reloc(obj->btf, obj->btf_ext, text->section_name,
+				    prog->insns_cnt, &prog->func_info,
+				    &prog->func_info_len);
+		if (err) {
+			pr_warning("error in btf_ext_reloc for sec %s\n",
+				   text->section_name);
+			return err;
+		}
+
 		memcpy(new_insn + prog->insns_cnt, text->insns,
 		       text->insns_cnt * sizeof(*insn));
 		prog->insns = new_insn;
@@ -1205,6 +1229,7 @@ bpf_program__reloc_text(struct bpf_program *prog, struct bpf_object *obj,
 		pr_debug("added %zd insn from %s to prog %s\n",
 			 text->insns_cnt, text->section_name,
 			 prog->section_name);
+
 	}
 	insn = &prog->insns[relo->insn_idx];
 	insn->imm += prog->main_prog_cnt - relo->insn_idx;
@@ -1216,7 +1241,19 @@ bpf_program__relocate(struct bpf_program *prog, struct bpf_object *obj)
 {
 	int i, err;
 
-	if (!prog || !prog->reloc_desc)
+	if (!prog)
+		return 0;
+
+	err = btf_ext_reloc_init(obj->btf, obj->btf_ext, prog->section_name,
+				 &prog->btf_fd, &prog->func_info,
+				 &prog->func_info_len);
+	if (err) {
+		pr_warning("err in btf_ext_reloc_init for sec %s\n",
+			    prog->section_name);
+		return err;
+	}
+
+	if (!prog->reloc_desc)
 		return 0;
 
 	for (i = 0; i < prog->nr_reloc; i++) {
@@ -1306,7 +1343,8 @@ static int bpf_object__collect_reloc(struct bpf_object *obj)
 static int
 load_program(enum bpf_prog_type type, enum bpf_attach_type expected_attach_type,
 	     const char *name, struct bpf_insn *insns, int insns_cnt,
-	     char *license, u32 kern_version, int *pfd, int prog_ifindex)
+	     char *license, u32 kern_version, int *pfd, int prog_ifindex,
+	     u32 btf_fd, struct bpf_func_info *func_info, u32 func_info_len)
 {
 	struct bpf_load_program_attr load_attr;
 	char *cp, errmsg[STRERR_BUFSIZE];
@@ -1322,6 +1360,9 @@ load_program(enum bpf_prog_type type, enum bpf_attach_type expected_attach_type,
 	load_attr.license = license;
 	load_attr.kern_version = kern_version;
 	load_attr.prog_ifindex = prog_ifindex;
+	load_attr.prog_btf_fd = btf_fd;
+	load_attr.func_info = func_info;
+	load_attr.func_info_len = func_info_len;
 
 	if (!load_attr.insns || !load_attr.insns_cnt)
 		return -EINVAL;
@@ -1405,7 +1446,9 @@ bpf_program__load(struct bpf_program *prog,
 		err = load_program(prog->type, prog->expected_attach_type,
 				   prog->name, prog->insns, prog->insns_cnt,
 				   license, kern_version, &fd,
-				   prog->prog_ifindex);
+				   prog->prog_ifindex,
+				   prog->btf_fd, prog->func_info,
+				   prog->func_info_len);
 		if (!err)
 			prog->instances.fds[0] = fd;
 		goto out;
@@ -1437,7 +1480,9 @@ bpf_program__load(struct bpf_program *prog,
 				   prog->name, result.new_insn_ptr,
 				   result.new_insn_cnt,
 				   license, kern_version, &fd,
-				   prog->prog_ifindex);
+				   prog->prog_ifindex,
+				   prog->btf_fd, prog->func_info,
+				   prog->func_info_len);
 
 		if (err) {
 			pr_warning("Loading the %dth instance of program '%s' failed\n",
@@ -1846,6 +1891,7 @@ void bpf_object__close(struct bpf_object *obj)
 	bpf_object__elf_finish(obj);
 	bpf_object__unload(obj);
 	btf__free(obj->btf);
+	btf_ext__free(obj->btf_ext);
 
 	for (i = 0; i < obj->nr_maps; i++) {
 		zfree(&obj->maps[i].name);
