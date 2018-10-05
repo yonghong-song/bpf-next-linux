@@ -2268,6 +2268,9 @@ static int do_test_file(unsigned int test_num)
 
 	fprintf(stderr, "OK");
 
+	/* sleep 60 seconds, so user can use bpftool do dump jited insns */
+	sleep(60);
+
 done:
 	bpf_object__close(obj);
 	return err;
