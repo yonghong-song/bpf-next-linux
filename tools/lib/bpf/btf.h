@@ -33,6 +33,11 @@ struct btf_sec_func_info {
 	__u8	data[0];
 };
 
+struct btf_sec_line_info {
+	__u32	sec_name_off;
+	__u32	num_line_info;
+};
+
 typedef int (*btf_print_fn_t)(const char *, ...)
 	__attribute__((format(printf, 1, 2)));
 

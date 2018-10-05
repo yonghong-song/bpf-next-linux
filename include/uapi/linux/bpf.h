@@ -2816,4 +2816,11 @@ struct bpf_func_info {
 	__u32	type_id;
 };
 
+struct bpf_line_info {
+	__u32	insn_offset;
+	__u32	file_name_off;
+	__u32	line_off;
+	__u32	line_col; /* line num: line_col >> 10, col num: line_col & 0x3ff */
+};
+
 #endif /* _UAPI__LINUX_BPF_H__ */

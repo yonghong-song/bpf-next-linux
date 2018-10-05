@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1
 /* Copyright (c) 2018 Facebook */
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -505,12 +506,81 @@ static int btf_ext_validate_func_info(const struct btf_sec_func_info *sinfo,
 
 	return 0;
 }
+
+static int btf_ext_validate_line_info(const struct btf_sec_line_info *linfo,
+				      __u32 size, btf_print_fn_t err_log)
+{
+	const struct btf_sec_line_info *orig_linfo = linfo;
+	int sec_hdrlen = sizeof(struct btf_sec_line_info);
+	__u32 record_size = sizeof(struct bpf_line_info);
+	__u32 size_left = size, num_records;
+	__u64 total_record_size;
+
+	while (size_left) {
+		if (size_left < sec_hdrlen) {
+			elog("BTF.ext line_info header not found");
+			return -EINVAL;
+		}
+
+		num_records = linfo->num_line_info;
+		if (num_records == 0) {
+			elog("incorrect BTF.ext num_line_info");
+			return -EINVAL;
+		}
+
+		total_record_size = sec_hdrlen +
+				    (__u64)num_records * record_size;
+		if (size_left < total_record_size) {
+			elog("incorrect BTF.ext num_line_info");
+			return -EINVAL;
+		}
+
+		size_left -= total_record_size;
+		linfo = (void *)linfo + total_record_size;
+	}
+
+/* Since line_info is not implemented yet in the kernel, dump
+ * the line_info data for visual inspection.
+ */
+#define DUMP_LINE_INFO
+#ifdef DUMP_LINE_INFO
+	linfo = orig_linfo;
+	size_left = size;
+	while (size_left) {
+		__u32 sec_name_off = linfo->sec_name_off;
+		struct bpf_line_info *linfo_entry;
+		int i;
+
+		num_records = linfo->num_line_info;
+		printf("\nsec_name_off %u, num_records %u\n",
+		       sec_name_off, num_records);
+		linfo_entry = (void *)linfo + sec_hdrlen;
+		for (i = 0; i < num_records; i++)
+			printf("\tinsn_offset %u file_name_off %u"
+			       " line_off %u line_col 0x%x\n",
+			       linfo_entry[i].insn_offset,
+			       linfo_entry[i].file_name_off,
+			       linfo_entry[i].line_off,
+			       linfo_entry[i].line_col);
+
+		total_record_size = sec_hdrlen +
+				    (__u64)num_records * record_size;
+		size_left -= total_record_size;
+		linfo = (void *)linfo + total_record_size;
+	}
+#endif
+
+	return 0;
+}
+
 static int btf_ext_parse_hdr(__u8 *data, __u32 data_size,
 			     btf_print_fn_t err_log)
 {
 	const struct btf_ext_header *hdr = (struct btf_ext_header *)data;
 	const struct btf_sec_func_info *sinfo;
+	const struct btf_sec_line_info *linfo;
 	__u32 meta_left, last_func_info_pos;
+	int ret;
 
 	if (data_size < sizeof(*hdr)) {
 		elog("BTF.ext header not found");
@@ -559,7 +629,14 @@ static int btf_ext_parse_hdr(__u8 *data, __u32 data_size,
 
 	sinfo = (const struct btf_sec_func_info *)(data + sizeof(*hdr) +
 						   hdr->func_info_off);
-	return btf_ext_validate_func_info(sinfo, hdr->func_info_len,
+	ret = btf_ext_validate_func_info(sinfo, hdr->func_info_len,
+					 err_log);
+	if (ret < 0)
+		return ret;
+
+	linfo = (const struct btf_sec_line_info *)(data + sizeof(*hdr) +
+						   hdr->line_info_off);
+	return btf_ext_validate_line_info(linfo, hdr->line_info_len,
 					  err_log);
 }
 
