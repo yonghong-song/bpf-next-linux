@@ -40,7 +40,8 @@ struct btf_type {
 	/* "size" is used by INT, ENUM, STRUCT and UNION.
 	 * "size" tells the size of the type it is describing.
 	 *
-	 * "type" is used by PTR, TYPEDEF, VOLATILE, CONST and RESTRICT.
+	 * "type" is used by PTR, TYPEDEF, VOLATILE, CONST, RESTRICT,
+	 * FUNC and FUNC_PROTO.
 	 * "type" is a type_id referring to another type.
 	 */
 	union {
@@ -64,8 +65,10 @@ struct btf_type {
 #define BTF_KIND_VOLATILE	9	/* Volatile	*/
 #define BTF_KIND_CONST		10	/* Const	*/
 #define BTF_KIND_RESTRICT	11	/* Restrict	*/
-#define BTF_KIND_MAX		11
-#define NR_BTF_KINDS		12
+#define BTF_KIND_FUNC		12	/* Function	*/
+#define BTF_KIND_FUNC_PROTO	13	/* Function Prototype	*/
+#define BTF_KIND_MAX		13
+#define NR_BTF_KINDS		14
 
 /* For some specific BTF_KIND, "struct btf_type" is immediately
  * followed by extra data.
