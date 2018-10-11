@@ -2235,10 +2235,16 @@ done:
 static int do_test_file(unsigned int test_num)
 {
 	const struct btf_file_test *test = &file_tests[test_num - 1];
+	const char *expected_fnames[] = {"_dummy_tracepoint",
+					 "test_long_fname_1",
+					 "test_long_fname_2"};
+	__u32 func_lens[10], func_types[10], info_len;
+	struct bpf_prog_info info = {};
 	struct bpf_object *obj = NULL;
 	struct bpf_program *prog;
+	struct btf *btf = NULL;
 	struct bpf_map *map;
-	int err;
+	int i, err, prog_fd;
 
 	fprintf(stderr, "BTF libbpf test[%u] (%s): ", test_num,
 		test->file);
@@ -2271,6 +2277,7 @@ static int do_test_file(unsigned int test_num)
 	err = bpf_object__load(obj);
 	if (CHECK(err < 0, "bpf_object__load: %d", err))
 		goto done;
+	prog_fd = bpf_program__fd(prog);
 
 	map = bpf_object__find_map_by_name(obj, "btf_map");
 	if (CHECK(!map, "btf_map not found")) {
@@ -2285,6 +2292,69 @@ static int do_test_file(unsigned int test_num)
 		  test->btf_kv_notfound))
 		goto done;
 
+	if (!jit_enabled)
+		goto skip_jit;
+
+	info_len = sizeof(struct bpf_prog_info);
+	info.nr_jited_func_types = ARRAY_SIZE(func_types);
+	info.nr_jited_func_lens = ARRAY_SIZE(func_lens);
+	info.jited_func_types = ptr_to_u64(&func_types[0]);
+	info.jited_func_lens = ptr_to_u64(&func_lens[0]);
+
+	err = bpf_obj_get_info_by_fd(prog_fd, &info, &info_len);
+
+	if (CHECK(err == -1, "invalid get info errno:%d", errno)) {
+		fprintf(stderr, "%s\n", btf_log_buf);
+		err = -1;
+		goto done;
+	}
+	if (CHECK(info.nr_jited_func_lens != 3,
+		  "incorrect info.nr_jited_func_lens %d",
+		  info.nr_jited_func_lens)) {
+		err = -1;
+		goto done;
+	}
+	if (CHECK(info.nr_jited_func_types != 3,
+		  "incorrect info.nr_jited_func_types %d",
+		  info.nr_jited_func_types)) {
+		err = -1;
+		goto done;
+	}
+	if (CHECK(info.btf_id == 0, "incorrect btf_id = 0")) {
+		err = -1;
+		goto done;
+	}
+
+	err = btf_get_from_id(info.btf_id, &btf);
+	if (CHECK(err, "cannot get btf from kernel, err: %d", err))
+		goto done;
+
+	/* check three functions */
+	for (i = 0; i < 3; i++) {
+		const struct btf_type *t;
+		const char *fname;
+
+		t = btf__type_by_id(btf, func_types[i]);
+		if (CHECK(!t, "btf__type_by_id failure: id %u",
+			  func_types[i])) {
+			err = -1;
+			goto done;
+		}
+
+		fname = btf__name_by_offset(btf, t->name_off);
+		err = strcmp(fname, expected_fnames[i]);
+		/* for the second and third functions in .text section,
+		 * the compiler may order them either way.
+		 */
+		if (i && err)
+			err = strcmp(fname, expected_fnames[3 - i]);
+		if (CHECK(err, "incorrect fname %s", fname ? : "")) {
+			err = -1;
+			goto done;
+		}
+	}
+
+skip_jit:
 	fprintf(stderr, "OK");
 
 done:
